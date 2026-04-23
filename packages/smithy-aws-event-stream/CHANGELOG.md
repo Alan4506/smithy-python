@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.2.2
+
+### Enhancements
+* Handle unknown event types gracefully instead of crashing.
+
 ## v0.2.1
 
 ### Dependencies

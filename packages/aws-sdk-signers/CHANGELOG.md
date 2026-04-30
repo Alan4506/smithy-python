@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.2.1
+
+### Enhancements
+* Non-prod test entry
+
 ## v0.2.0
 
 ### Breaking Changes

@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.3.1
+
+### Enhancements
+* Non-prod test entry
+
 ## v0.3.0
 
 ### Features

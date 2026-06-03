@@ -330,6 +330,34 @@ class _AWSJSONClientProtocol(HttpClientProtocol):
     ) -> bool:
         return 200 <= response.status < 300
 
+    @staticmethod
+    def _resolve_error_id(
+        candidate: ShapeID | None,
+        error_registry: TypeRegistry,
+        default_namespace: str,
+    ) -> ShapeID | None:
+        """Resolve a parsed error shape ID against the error registry.
+
+        Falls back to the service's default namespace if the candidate's
+        namespace differs (e.g. DynamoDB sends ``com.amazonaws.dynamodb.v20120810``
+        while the model uses ``com.amazonaws.dynamodb``).
+
+        :param candidate: The shape ID parsed from the response, if any.
+        :param error_registry: The registry of modeled errors for the operation.
+        :param default_namespace: The service namespace to use as a fallback.
+        :returns: A shape ID present in the registry, or None if unresolved.
+        """
+        if candidate is None:
+            return None
+        if candidate in error_registry:
+            return candidate
+        relative_id = ShapeID.from_parts(
+            namespace=default_namespace, name=candidate.name
+        )
+        if relative_id in error_registry:
+            return relative_id
+        return None
+
     async def _create_error(
         self,
         *,
@@ -350,11 +378,14 @@ class _AWSJSONClientProtocol(HttpClientProtocol):
         ):
             deserializer = self.payload_codec.create_deserializer(response_body)
             document = deserializer.read_document(schema=DOCUMENT)
-            if document.discriminator in error_registry:
-                error_id = document.discriminator
+            error_id = document.discriminator
 
-        if error_id is not None and error_id in error_registry:
-            error_shape = error_registry.get(error_id)
+        resolved_id = self._resolve_error_id(
+            error_id, error_registry, operation.schema.id.namespace
+        )
+
+        if resolved_id is not None:
+            error_shape = error_registry.get(resolved_id)
 
             # make sure the error shape is derived from modeled exception
             if not issubclass(error_shape, ModeledError):

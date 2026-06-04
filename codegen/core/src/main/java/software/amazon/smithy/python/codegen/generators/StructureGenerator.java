@@ -276,6 +276,15 @@ public final class StructureGenerator implements Runnable {
         // see: https://smithy.io/2.0/spec/type-refinement-traits.html#smithy-api-default-trait
         var defaultNode = member.expectTrait(DefaultTrait.class).toNode();
         var target = model.expectShape(member.getTarget());
+        // A `@default: null` resolves to Python `None` regardless of the target
+        // type. Handle it up front: the type-specific branches below call
+        // expectStringNode()/expectNumberNode() etc., which would throw on a null
+        // node (e.g. `blob: Blob = null` or `timestamp: Timestamp = null`).
+        // Document shapes are excluded: a null document default is a non-None
+        // Document(None), handled in its own branch below.
+        if (defaultNode.isNullNode() && !target.isDocumentShape()) {
+            return "None";
+        }
         if (target.isTimestampShape()) {
             ZonedDateTime value = CodegenUtils.parseTimestampNode(model, member, defaultNode);
             return CodegenUtils.getDatetimeConstructor(writer, value);

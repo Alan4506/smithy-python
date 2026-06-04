@@ -207,6 +207,15 @@ public final class StructureGenerator implements Runnable {
             if (member.hasTrait(DefaultTrait.class)) {
 
                 defaultValue = getDefaultValue(writer, member);
+                // A `@default: null` member is genuinely nullable, so it needs a
+                // `| None` annotation just like a member with no default (the
+                // resolved default value is "None"). Document shapes are excluded:
+                // a document with a null default is a non-None Document holding a
+                // null value, handled via default_factory below.
+                if (!target.isDocumentShape()
+                        && member.expectTrait(DefaultTrait.class).toNode().isNullNode()) {
+                    writer.putContext("nullable", true);
+                }
                 if (target.isDocumentShape() || defaultValue.startsWith("list[") || defaultValue.startsWith("dict[")) {
                     writer.addStdlibImport("dataclasses", "field");
                     defaultKey = "default_factory";

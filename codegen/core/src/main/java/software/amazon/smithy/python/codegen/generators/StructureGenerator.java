@@ -207,6 +207,14 @@ public final class StructureGenerator implements Runnable {
             if (member.hasTrait(DefaultTrait.class)) {
 
                 defaultValue = getDefaultValue(writer, member);
+                // A `@default: null` member is nullable and resolves to None, so
+                // it needs `| None` like a member with no default. Documents are
+                // excluded: a null document default is a non-None Document(None),
+                // built via default_factory below.
+                if (!target.isDocumentShape()
+                        && member.expectTrait(DefaultTrait.class).toNode().isNullNode()) {
+                    writer.putContext("nullable", true);
+                }
                 if (target.isDocumentShape() || defaultValue.startsWith("list[") || defaultValue.startsWith("dict[")) {
                     writer.addStdlibImport("dataclasses", "field");
                     defaultKey = "default_factory";
@@ -267,6 +275,13 @@ public final class StructureGenerator implements Runnable {
         // see: https://smithy.io/2.0/spec/type-refinement-traits.html#smithy-api-default-trait
         var defaultNode = member.expectTrait(DefaultTrait.class).toNode();
         var target = model.expectShape(member.getTarget());
+        // A `@default: null` resolves to None. Return it before the type branches
+        // below, which assume a typed value: e.g. a blob calls expectStringNode()
+        // and would throw on a null node. Documents are excluded (a null document
+        // default is Document(None), handled in its own branch below).
+        if (defaultNode.isNullNode() && !target.isDocumentShape()) {
+            return "None";
+        }
         if (target.isTimestampShape()) {
             ZonedDateTime value = CodegenUtils.parseTimestampNode(model, member, defaultNode);
             return CodegenUtils.getDatetimeConstructor(writer, value);

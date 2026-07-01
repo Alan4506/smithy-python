@@ -60,7 +60,9 @@ async def test_standard_retry_eventually_succeeds():
 
     assert result == "success"
     assert attempts == 3
-    assert quota.available_capacity == 495
+    # 2 retries drain 14 each (500 -> 472); success releases the last retry's
+    # cost (14) back -> 486.
+    assert quota.available_capacity == 486
 
 
 async def test_standard_retry_fails_due_to_max_attempts():
@@ -70,11 +72,12 @@ async def test_standard_retry_fails_due_to_max_attempts():
     with pytest.raises(CallError, match="502"):
         await retry_operation(strategy, [502, 502, 502])
 
-    assert quota.available_capacity == 490
+    # 2 retries drain 14 each; no success release on max-attempts failure.
+    assert quota.available_capacity == 472
 
 
 async def test_retry_quota_exhausted_after_single_retry():
-    quota = StandardRetryQuota(initial_capacity=5)
+    quota = StandardRetryQuota(initial_capacity=14)
     strategy = StandardRetryStrategy(max_attempts=3, retry_quota=quota)
 
     with pytest.raises(CallError, match="502"):
@@ -94,26 +97,27 @@ async def test_retry_quota_prevents_retries_when_quota_zero():
 
 
 async def test_retry_quota_stops_retries_when_exhausted():
-    quota = StandardRetryQuota(initial_capacity=10)
+    quota = StandardRetryQuota(initial_capacity=20)
     strategy = StandardRetryStrategy(max_attempts=5, retry_quota=quota)
 
-    with pytest.raises(CallError, match="503"):
-        await retry_operation(strategy, [500, 502, 503])
+    with pytest.raises(CallError, match="502"):
+        await retry_operation(strategy, [500, 502])
 
-    assert quota.available_capacity == 0
+    # First retry drains 14 (20 -> 6); second retry needs 14 > 6 -> exhausted.
+    assert quota.available_capacity == 6
 
 
 async def test_retry_quota_recovers_after_successful_responses():
-    quota = StandardRetryQuota(initial_capacity=15)
+    quota = StandardRetryQuota(initial_capacity=30)
     strategy = StandardRetryStrategy(max_attempts=5, retry_quota=quota)
 
-    # First operation: 2 retries then success
+    # First operation: 2 retries then success (30 -> 2, release 14 -> 16)
     await retry_operation(strategy, [500, 502, 200])
-    assert quota.available_capacity == 10
+    assert quota.available_capacity == 16
 
-    # Second operation: 1 retry then success
+    # Second operation: 1 retry then success (16 -> 2, release 14 -> 16)
     await retry_operation(strategy, [500, 200])
-    assert quota.available_capacity == 10
+    assert quota.available_capacity == 16
 
 
 async def test_retry_quota_shared_across_concurrent_operations():
@@ -136,7 +140,8 @@ async def test_retry_quota_shared_across_concurrent_operations():
 
     assert result1 == ("success", 3)
     assert result2 == ("success", 2)
-    assert quota.available_capacity == 495
+    # op1 keeps 14 consumed (28 drained, 14 released on success); op2 nets 0.
+    assert quota.available_capacity == 486
 
 
 async def test_retry_quota_handles_timeout_errors():
@@ -150,4 +155,6 @@ async def test_retry_quota_handles_timeout_errors():
 
     assert result == "success"
     assert attempts == 3
-    assert quota.available_capacity == 490
+    # Timeouts are no longer charged a special cost; they use RETRY_COST (14).
+    # 2 retries drain 28 (500 -> 472); success releases 14 -> 486.
+    assert quota.available_capacity == 486

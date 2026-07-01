@@ -22,7 +22,34 @@ class RetryStrategyResolver:
 
     This resolver caches retry strategy instances based on their configuration to reuse existing
     instances of RetryStrategy with the same settings. Uses LRU cache for thread-safe caching.
+
+    Service-specific defaults may be supplied (e.g. by generated clients) for
+    options the customer did not configure explicitly. These are applied on a
+    per-value basis: a customer-provided value always takes precedence, and a
+    default only fills in a value that was not provided. For example, DynamoDB
+    clients pass ``default_max_attempts=4`` and ``default_backoff_scale=0.025``,
+    so a customer who only overrides ``max_attempts`` still gets DynamoDB's
+    25ms base backoff.
     """
+
+    def __init__(
+        self,
+        *,
+        default_max_attempts: int | None = None,
+        default_backoff_scale: float | None = None,
+    ):
+        """Initialize the resolver with optional service-specific defaults.
+
+        :param default_max_attempts: Default max attempts to use when the customer
+            does not configure one (standard mode only). If ``None``, the strategy's
+            own default is used.
+        :param default_backoff_scale: Default non-throttling base backoff scale (in
+            seconds) to use when the customer does not provide a fully configured
+            strategy (standard mode only). If ``None``, the strategy's own default
+            is used.
+        """
+        self._default_max_attempts = default_max_attempts
+        self._default_backoff_scale = default_backoff_scale
 
     async def resolve_retry_strategy(
         self, *, retry_strategy: RetryStrategy | RetryStrategyOptions | None
@@ -48,7 +75,10 @@ class RetryStrategyResolver:
     def _create_retry_strategy(
         self, retry_mode: RetryStrategyType, max_attempts: int | None
     ) -> RetryStrategy:
-        kwargs = {"max_attempts": max_attempts}
+        if max_attempts is None:
+            max_attempts = self._default_max_attempts
+
+        kwargs: dict[str, Any] = {"max_attempts": max_attempts}
         filtered_kwargs: dict[str, Any] = {
             k: v for k, v in kwargs.items() if v is not None
         }
@@ -56,6 +86,14 @@ class RetryStrategyResolver:
             case "simple":
                 return SimpleRetryStrategy(**filtered_kwargs)
             case "standard":
+                if self._default_backoff_scale is not None:
+                    filtered_kwargs["backoff_strategy"] = (
+                        ExponentialRetryBackoffStrategy(
+                            backoff_scale_value=self._default_backoff_scale,
+                            max_backoff=20,
+                            jitter_type=ExponentialBackoffJitterType.FULL,
+                        )
+                    )
                 return StandardRetryStrategy(**filtered_kwargs)
             case _:
                 raise ValueError(f"Unknown retry mode: {retry_mode}")
@@ -80,11 +118,12 @@ class SimpleRetryStrategy:
         self.max_attempts = max_attempts
 
     async def acquire_initial_retry_token(
-        self, *, token_scope: str | None = None
+        self, *, token_scope: str | None = None, is_long_polling: bool = False
     ) -> SimpleRetryToken:
         """Create a base retry token for the start of a request.
 
         :param token_scope: This argument is ignored by this retry strategy.
+        :param is_long_polling: This argument is ignored by this retry strategy.
         """
         retry_delay = self.backoff_strategy.compute_next_backoff_delay(0)
         return SimpleRetryToken(retry_count=0, retry_delay=retry_delay)
@@ -123,18 +162,35 @@ class SimpleRetryStrategy:
 
 
 class StandardRetryStrategy:
+    _RETRY_AFTER_MAX_ADDITIONAL: float = 5
+    """Maximum number of seconds a server-directed backoff (e.g. x-amz-retry-after)
+    may exceed the normal computed backoff (t_i)."""
+
+    _NON_THROTTLING_BACKOFF_SCALE: float = 0.05
+    """Base backoff scale (seconds) for non-throttling errors (50ms)."""
+
+    _THROTTLING_BACKOFF_SCALE: float = 1
+    """Base backoff scale (seconds) for throttling errors (1000ms)."""
+
     def __init__(
         self,
         *,
         backoff_strategy: retries_interface.RetryBackoffStrategy | None = None,
+        throttling_backoff_strategy: retries_interface.RetryBackoffStrategy
+        | None = None,
         max_attempts: int = 3,
         retry_quota: StandardRetryQuota | None = None,
     ):
         """Standard retry strategy using truncated binary exponential backoff
         with full jitter.
 
-        :param backoff_strategy: The backoff strategy used by returned tokens to compute
-        the retry delay. Defaults to :py:class:`ExponentialRetryBackoffStrategy`.
+        :param backoff_strategy: The backoff strategy used to compute the retry delay
+            for non-throttling errors. Defaults to a 50ms-base
+            :py:class:`ExponentialRetryBackoffStrategy`.
+
+        :param throttling_backoff_strategy: The backoff strategy used to compute the
+            retry delay for throttling errors. Defaults to a 1000ms-base
+            :py:class:`ExponentialRetryBackoffStrategy`.
 
         :param max_attempts: Upper limit on total number of attempts made, including
             initial attempt and retries.
@@ -148,22 +204,35 @@ class StandardRetryStrategy:
             )
 
         self.backoff_strategy = backoff_strategy or ExponentialRetryBackoffStrategy(
-            backoff_scale_value=1,
+            backoff_scale_value=self._NON_THROTTLING_BACKOFF_SCALE,
             max_backoff=20,
             jitter_type=ExponentialBackoffJitterType.FULL,
+        )
+        self.throttling_backoff_strategy = (
+            throttling_backoff_strategy
+            or ExponentialRetryBackoffStrategy(
+                backoff_scale_value=self._THROTTLING_BACKOFF_SCALE,
+                max_backoff=20,
+                jitter_type=ExponentialBackoffJitterType.FULL,
+            )
         )
         self.max_attempts = max_attempts
         self._retry_quota = retry_quota or StandardRetryQuota()
 
     async def acquire_initial_retry_token(
-        self, *, token_scope: str | None = None
+        self, *, token_scope: str | None = None, is_long_polling: bool = False
     ) -> StandardRetryToken:
         """Create a base retry token for the start of a request.
 
         :param token_scope: This argument is ignored by this retry strategy.
+        :param is_long_polling: Whether the operation is a long-polling operation.
+            Long-polling operations back off before returning even when the retry
+            quota is exhausted.
         """
         retry_delay = self.backoff_strategy.compute_next_backoff_delay(0)
-        return StandardRetryToken(retry_count=0, retry_delay=retry_delay)
+        return StandardRetryToken(
+            retry_count=0, retry_delay=retry_delay, is_long_polling=is_long_polling
+        )
 
     async def refresh_retry_token_for_retry(
         self,
@@ -192,21 +261,36 @@ class StandardRetryStrategy:
                     f"Reached maximum number of allowed attempts: {self.max_attempts}"
                 ) from error
 
-            # Acquire additional quota for this retry attempt
-            # (may raise a RetryError if none is available)
-            quota_acquired = self._retry_quota.acquire(error=error)
+            # Throttling errors use a larger base backoff than other errors.
+            backoff_strategy = (
+                self.throttling_backoff_strategy
+                if error.is_throttling_error
+                else self.backoff_strategy
+            )
+            t_i = backoff_strategy.compute_next_backoff_delay(retry_count)
+
+            try:
+                quota_acquired = self._retry_quota.acquire(error=error)
+            except RetryError as quota_error:
+                # Long-polling operations back off before giving up even when the
+                # quota is exhausted; surface the delay for the caller to honor.
+                if token_to_renew.is_long_polling:
+                    raise RetryError(str(quota_error), retry_after=t_i) from error
+                raise
 
             if error.retry_after is not None:
-                retry_delay = error.retry_after
-            else:
-                retry_delay = self.backoff_strategy.compute_next_backoff_delay(
-                    retry_count
+                # Bound a server-directed backoff to [t_i, t_i + 5] seconds.
+                retry_delay = max(
+                    t_i, min(error.retry_after, self._RETRY_AFTER_MAX_ADDITIONAL + t_i)
                 )
+            else:
+                retry_delay = t_i
 
             return StandardRetryToken(
                 retry_count=retry_count,
                 retry_delay=retry_delay,
                 quota_acquired=quota_acquired,
+                is_long_polling=token_to_renew.is_long_polling,
             )
         else:
             raise RetryError(f"Error is not retryable: {error}") from error

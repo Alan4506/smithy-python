@@ -88,7 +88,17 @@ class DiscriminatorError(SmithyError):
 
 
 class RetryError(SmithyError):
-    """Base exception type for all exceptions raised in retry strategies."""
+    """Base exception type for all exceptions raised in retry strategies.
+
+    :param retry_after: An optional delay, in seconds, that the caller SHOULD wait
+        before abandoning retries. This is used for long-polling operations, which
+        must back off even when the retry quota is exhausted to avoid amplifying load
+        on the service during an outage.
+    """
+
+    def __init__(self, message: str = "", *, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 class ExpectationNotMetError(SmithyError):

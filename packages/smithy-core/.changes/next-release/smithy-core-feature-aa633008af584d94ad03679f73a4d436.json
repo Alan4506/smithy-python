@@ -1,0 +1,4 @@
+{
+  "type": "feature",
+  "description": "Added support for throttling-aware backoff, the `x-amz-retry-after` header, per-service retry defaults, and long-polling backoff."
+}

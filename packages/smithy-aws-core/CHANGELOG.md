@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.11.1
+
+### Enhancements
+* Update identity chain validation to use case-insensitive comparisons for provider names.
+
 ## v0.11.0
 
 ### Enhancements
